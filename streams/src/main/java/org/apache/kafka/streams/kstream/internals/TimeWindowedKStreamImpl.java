@@ -24,10 +24,11 @@ import org.apache.kafka.streams.kstream.Initializer;
 import org.apache.kafka.streams.kstream.KTable;
 import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.Reducer;
+import org.apache.kafka.streams.kstream.TimeWindowedKStream;
 import org.apache.kafka.streams.kstream.Window;
 import org.apache.kafka.streams.kstream.Windowed;
-import org.apache.kafka.streams.kstream.TimeWindowedKStream;
 import org.apache.kafka.streams.kstream.Windows;
+import org.apache.kafka.streams.kstream.internals.graph.StreamsGraphNode;
 import org.apache.kafka.streams.state.StoreBuilder;
 import org.apache.kafka.streams.state.Stores;
 import org.apache.kafka.streams.state.WindowBytesStoreSupplier;
@@ -52,26 +53,37 @@ public class TimeWindowedKStreamImpl<K, V, W extends Window> extends AbstractStr
                             final String name,
                             final Serde<K> keySerde,
                             final Serde<V> valSerde,
-                            final boolean repartitionRequired) {
-        super(builder, name, sourceNodes);
-        Objects.requireNonNull(windows, "windows can't be null");
+                            final boolean repartitionRequired,
+                            final StreamsGraphNode streamsGraphNode) {
+        super(builder, name, sourceNodes, streamsGraphNode);
         this.valSerde = valSerde;
         this.keySerde = keySerde;
-        this.windows = windows;
-        this.aggregateBuilder = new GroupedStreamAggregateBuilder<>(builder, keySerde, valSerde, repartitionRequired, sourceNodes, name);
+        this.windows = Objects.requireNonNull(windows, "windows can't be null");
+        this.aggregateBuilder = new GroupedStreamAggregateBuilder<>(builder, keySerde, valSerde, repartitionRequired, sourceNodes, name, streamsGraphNode);
     }
 
     @Override
     public KTable<Windowed<K>, Long> count() {
-        return count(Materialized.<K, Long, WindowStore<Bytes, byte[]>>with(keySerde, Serdes.Long()));
+        return doCount(Materialized.with(keySerde, Serdes.Long()));
     }
 
-    @SuppressWarnings("unchecked")
     @Override
     public KTable<Windowed<K>, Long> count(final Materialized<K, Long, WindowStore<Bytes, byte[]>> materialized) {
         Objects.requireNonNull(materialized, "materialized can't be null");
-        final MaterializedInternal<K, Long, WindowStore<Bytes, byte[]>> materializedInternal
-                = new MaterializedInternal<>(materialized, builder, AGGREGATE_NAME);
+
+        // TODO: remove this when we do a topology-incompatible release
+        // we used to burn a topology name here, so we have to keep doing it for compatibility
+        if (new MaterializedInternal<>(materialized).storeName() == null) {
+            builder.newStoreName(AGGREGATE_NAME);
+        }
+
+        return doCount(materialized);
+    }
+
+    private KTable<Windowed<K>, Long> doCount(final Materialized<K, Long, WindowStore<Bytes, byte[]>> materialized) {
+        final MaterializedInternal<K, Long, WindowStore<Bytes, byte[]>> materializedInternal = new MaterializedInternal<>(materialized);
+        materializedInternal.generateStoreNameIfNeeded(builder, AGGREGATE_NAME);
+
         if (materializedInternal.keySerde() == null) {
             materializedInternal.withKeySerde(keySerde);
         }
@@ -79,20 +91,26 @@ public class TimeWindowedKStreamImpl<K, V, W extends Window> extends AbstractStr
             materializedInternal.withValueSerde(Serdes.Long());
         }
 
-        return (KTable<Windowed<K>, Long>) aggregateBuilder.build(new KStreamWindowAggregate<>(windows, materializedInternal.storeName(), aggregateBuilder.countInitializer, aggregateBuilder.countAggregator),
-                AGGREGATE_NAME,
-                materialize(materializedInternal),
-                materializedInternal.isQueryable());
+        return aggregateBuilder.build(
+            new KStreamWindowAggregate<>(
+                windows,
+                materializedInternal.storeName(),
+                aggregateBuilder.countInitializer,
+                aggregateBuilder.countAggregator
+            ),
+            AGGREGATE_NAME,
+            materialize(materializedInternal),
+            materializedInternal.isQueryable()
+        );
     }
 
 
     @Override
     public <VR> KTable<Windowed<K>, VR> aggregate(final Initializer<VR> initializer,
                                                   final Aggregator<? super K, ? super V, VR> aggregator) {
-        return aggregate(initializer, aggregator, Materialized.<K, VR, WindowStore<Bytes, byte[]>>with(keySerde, null));
+        return aggregate(initializer, aggregator, Materialized.with(keySerde, null));
     }
 
-    @SuppressWarnings("unchecked")
     @Override
     public <VR> KTable<Windowed<K>, VR> aggregate(final Initializer<VR> initializer,
                                                   final Aggregator<? super K, ? super V, VR> aggregator,
@@ -100,30 +118,36 @@ public class TimeWindowedKStreamImpl<K, V, W extends Window> extends AbstractStr
         Objects.requireNonNull(initializer, "initializer can't be null");
         Objects.requireNonNull(aggregator, "aggregator can't be null");
         Objects.requireNonNull(materialized, "materialized can't be null");
-        final MaterializedInternal<K, VR, WindowStore<Bytes, byte[]>> materializedInternal
-                = new MaterializedInternal<>(materialized, builder, AGGREGATE_NAME);
+        final MaterializedInternal<K, VR, WindowStore<Bytes, byte[]>> materializedInternal = new MaterializedInternal<>(materialized);
+        materializedInternal.generateStoreNameIfNeeded(builder, AGGREGATE_NAME);
         if (materializedInternal.keySerde() == null) {
             materializedInternal.withKeySerde(keySerde);
         }
-        return (KTable<Windowed<K>, VR>) aggregateBuilder.build(new KStreamWindowAggregate<>(windows, materializedInternal.storeName(), initializer, aggregator),
-                                                                AGGREGATE_NAME,
-                                                                materialize(materializedInternal),
-                                                                materializedInternal.isQueryable());
+        return aggregateBuilder.build(
+            new KStreamWindowAggregate<>(
+                windows,
+                materializedInternal.storeName(),
+                initializer,
+                aggregator
+            ),
+            AGGREGATE_NAME,
+            materialize(materializedInternal),
+            materializedInternal.isQueryable());
     }
 
     @Override
     public KTable<Windowed<K>, V> reduce(final Reducer<V> reducer) {
-        return reduce(reducer, Materialized.<K, V, WindowStore<Bytes, byte[]>>with(keySerde, valSerde));
+        return reduce(reducer, Materialized.with(keySerde, valSerde));
     }
 
-    @SuppressWarnings("unchecked")
     @Override
     public KTable<Windowed<K>, V> reduce(final Reducer<V> reducer, final Materialized<K, V, WindowStore<Bytes, byte[]>> materialized) {
         Objects.requireNonNull(reducer, "reducer can't be null");
         Objects.requireNonNull(materialized, "materialized can't be null");
 
-        final MaterializedInternal<K, V, WindowStore<Bytes, byte[]>> materializedInternal
-                = new MaterializedInternal<>(materialized, builder, REDUCE_NAME);
+        final MaterializedInternal<K, V, WindowStore<Bytes, byte[]>> materializedInternal = new MaterializedInternal<>(materialized);
+        materializedInternal.generateStoreNameIfNeeded(builder, REDUCE_NAME);
+
         if (materializedInternal.keySerde() == null) {
             materializedInternal.withKeySerde(keySerde);
         }
@@ -131,24 +155,65 @@ public class TimeWindowedKStreamImpl<K, V, W extends Window> extends AbstractStr
             materializedInternal.withValueSerde(valSerde);
         }
 
-        return (KTable<Windowed<K>, V>) aggregateBuilder.build(new KStreamWindowReduce<K, V, W>(windows, materializedInternal.storeName(), reducer),
-                                                               REDUCE_NAME,
-                                                               materialize(materializedInternal),
-                                                               materializedInternal.isQueryable());
+        return aggregateBuilder.build(
+            new KStreamWindowReduce<>(windows, materializedInternal.storeName(), reducer),
+            REDUCE_NAME,
+            materialize(materializedInternal),
+            materializedInternal.isQueryable()
+        );
     }
 
+    @SuppressWarnings("deprecation") // continuing to support Windows#maintainMs/segmentInterval in fallback mode
     private <VR> StoreBuilder<WindowStore<K, VR>> materialize(final MaterializedInternal<K, VR, WindowStore<Bytes, byte[]>> materialized) {
         WindowBytesStoreSupplier supplier = (WindowBytesStoreSupplier) materialized.storeSupplier();
         if (supplier == null) {
-            supplier = Stores.persistentWindowStore(materialized.storeName(),
-                                                    windows.maintainMs(),
-                                                    windows.segments,
-                                                    windows.size(),
-                                                    false);
+            if (materialized.retention() != null) {
+                // new style retention: use Materialized retention and default segmentInterval
+                final long retentionPeriod = materialized.retention().toMillis();
+
+                if ((windows.size() + windows.gracePeriodMs()) > retentionPeriod) {
+                    throw new IllegalArgumentException("The retention period of the window store "
+                                                           + name + " must be no smaller than its window size plus the grace period."
+                                                           + " Got size=[" + windows.size() + "],"
+                                                           + " grace=[" + windows.gracePeriodMs() + "],"
+                                                           + " retention=[" + retentionPeriod + "]");
+                }
+
+                supplier = Stores.persistentWindowStore(
+                    materialized.storeName(),
+                    retentionPeriod,
+                    windows.size(),
+                    false
+                );
+
+            } else {
+                // old style retention: use deprecated Windows retention/segmentInterval.
+
+                // NOTE: in the future, when we remove Windows#maintainMs(), we should set the default retention
+                // to be (windows.size() + windows.grace()). This will yield the same default behavior.
+
+                if ((windows.size() + windows.gracePeriodMs()) > windows.maintainMs()) {
+                    throw new IllegalArgumentException("The retention period of the window store "
+                                                           + name + " must be no smaller than its window size plus the grace period."
+                                                           + " Got size=[" + windows.size() + "],"
+                                                           + " grace=[" + windows.gracePeriodMs() + "],"
+                                                           + " retention=[" + windows.maintainMs() + "]");
+                }
+
+                supplier = Stores.persistentWindowStore(
+                    materialized.storeName(),
+                    windows.maintainMs(),
+                    windows.size(),
+                    false,
+                    windows.segmentInterval()
+                );
+            }
         }
-        final StoreBuilder<WindowStore<K, VR>> builder = Stores.windowStoreBuilder(supplier,
-                                                                                   materialized.keySerde(),
-                                                                                   materialized.valueSerde());
+        final StoreBuilder<WindowStore<K, VR>> builder = Stores.windowStoreBuilder(
+            supplier,
+            materialized.keySerde(),
+            materialized.valueSerde()
+        );
 
         if (materialized.loggingEnabled()) {
             builder.withLoggingEnabled(materialized.logConfig());
